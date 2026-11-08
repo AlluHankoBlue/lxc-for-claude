@@ -1,0 +1,321 @@
+#!/bin/bash
+# claude-box: per-project Incus containers for Claude Code (+ Docker), reachable by herdr over SSH.
+set -euo pipefail
+ORIG_ARGS=("$@")
+
+HERE=$(dirname "$(readlink -f "$0")")
+PREFIX=cb-
+IMAGE=${CB_IMAGE:-claude-base}
+POOL=${CB_POOL:-default}
+PROFILE=claude-dev
+AUTH_VOL=claude-auth
+PORT_BASE=${CB_PORT_BASE:-2201}
+KEY=$HOME/.ssh/claude-box_ed25519
+KNOWN=$HOME/.ssh/claude-box_known_hosts
+SSHD_DIR=$HOME/.ssh/claude-box.d
+SSH_CONFIG=$HOME/.ssh/config
+
+die()  { echo "claude-box: $*" >&2; exit 1; }
+info() { printf '\033[1;32m>>\033[0m %s\n' "$*"; }
+
+need_incus() {
+  command -v incus >/dev/null || die "incus not installed"
+  incus info >/dev/null 2>&1 && return 0
+  # Member of incus-admin in /etc/group but this login session predates it (Ubuntu 26.04 has no newgrp/sg).
+  # Re-run ourselves as the same user with incus-admin as primary group via sudo -g (asks your password once).
+  if [ -z "${CB_REEXEC:-}" ] && id -nG "$(id -un)" | grep -qw incus-admin \
+     && ! id -nG | grep -qw incus-admin && command -v sudo >/dev/null; then
+    info "session lacks incus-admin group; re-running via 'sudo -u $(id -un) -g incus-admin' (log out/in to avoid this)"
+    local envs=(CB_REEXEC=1) v
+    for v in CB_POOL CB_IMAGE CB_PORT_BASE CB_SOURCE_IMAGE CB_HERDR_BIN TERM; do
+      [ -n "${!v:-}" ] && envs+=("$v=${!v}")
+    done
+    exec sudo -u "$(id -un)" -g incus-admin -- env "${envs[@]}" "$HERE/claude-box" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+  fi
+  die "cannot talk to incus daemon. Log out and back in (or reboot) so your session gets the incus-admin group."
+}
+ct()  { echo "${PREFIX}$1"; }
+valid_name() { [[ $1 =~ ^[a-z0-9]([a-z0-9-]{0,40}[a-z0-9])?$ ]] || die "invalid name '$1' (use a-z, 0-9, -)"; }
+exists() { incus info "$(ct "$1")" >/dev/null 2>&1; }
+port_of() { incus config get "$(ct "$1")" user.claude-box.sshport 2>/dev/null || true; }
+
+usage() {
+  cat <<EOF
+Usage: claude-box <command> [args]
+
+  setup [--rebuild]            one-time host setup (volume, profile, ssh key, base image)
+  rebuild-base                 rebuild the '$IMAGE' image (update Claude Code / OS)
+  new <name> <host-dir> [--from <template>] [--herd]
+                               create box ${PREFIX}<name> with <host-dir> at /workspace
+                               --from starts from a saved template instead of '$IMAGE'
+                               --herd also registers it in herdr (herdr machine add)
+  claude <name> [--yolo] [args]  run Claude Code in /workspace (--yolo = skip permissions)
+  shell <name>                 login shell in the box (incus exec)
+  ssh <name> [cmd]             ssh into the box (same path herdr uses)
+  herd <name>                  register the box in herdr
+  snap <name> [label]          snapshot the box (NOT the bind-mounted /workspace)
+  restore <name> <label>       restore a snapshot
+  template <name> [tpl]        save box as reusable template image 'tpl-<tpl>' (default tpl=<name>)
+  templates                    list base image + templates
+  rm-template <tpl>            delete a template image
+  start|stop <name>
+  rm <name> [-y]               delete box, its ssh config, known_hosts entry, herdr machine
+  ls                           list boxes
+EOF
+}
+
+ensure_ssh_include() {
+  mkdir -p "$SSHD_DIR"; chmod 700 "$HOME/.ssh" "$SSHD_DIR"
+  touch "$SSH_CONFIG"; chmod 600 "$SSH_CONFIG"
+  local line="Include $SSHD_DIR/*.conf"
+  if ! grep -qxF "$line" "$SSH_CONFIG"; then
+    # Must be at the top (before any Host/Match block) to apply globally.
+    local tmp; tmp=$(mktemp)
+    { echo "$line"; echo; cat "$SSH_CONFIG"; } > "$tmp" && cat "$tmp" > "$SSH_CONFIG" && rm -f "$tmp"
+    info "added '$line' to top of $SSH_CONFIG"
+  fi
+}
+
+cmd_setup() {
+  need_incus
+  if [ -z "$(incus storage list -f csv 2>/dev/null)" ]; then
+    info "no storage pool; running 'incus admin init --minimal'"
+    incus admin init --minimal
+  fi
+  incus storage show "$POOL" >/dev/null 2>&1 || die "storage pool '$POOL' not found (set CB_POOL)"
+
+  if ! incus storage volume show "$POOL" "$AUTH_VOL" >/dev/null 2>&1; then
+    info "creating shared volume $POOL/$AUTH_VOL"
+    incus storage volume create "$POOL" "$AUTH_VOL"
+  fi
+
+  incus profile show "$PROFILE" >/dev/null 2>&1 || incus profile create "$PROFILE"
+  sed "s/^\(    pool: \).*/\1$POOL/" "$HERE/profile-claude-dev.yaml" | incus profile edit "$PROFILE"
+  info "profile '$PROFILE' loaded"
+
+  if [ ! -f "$KEY" ]; then
+    ssh-keygen -t ed25519 -N '' -C "claude-box@$(hostname)" -f "$KEY" >/dev/null
+    info "generated $KEY"
+  fi
+  touch "$KNOWN"; chmod 600 "$KNOWN"
+  ensure_ssh_include
+
+  if [ "${1:-}" = --rebuild ] || ! incus image info "$IMAGE" >/dev/null 2>&1; then
+    "$HERE/build-base.sh"
+  else
+    info "image '$IMAGE' exists (use 'setup --rebuild' or 'rebuild-base' to refresh)"
+  fi
+  info "setup complete"
+}
+
+next_port() {
+  local used p c
+  used=$(for c in $(incus list -f csv -c n "^${PREFIX}" 2>/dev/null); do
+           incus config get "$c" user.claude-box.sshport 2>/dev/null; done)
+  p=$PORT_BASE
+  while grep -qx "$p" <<<"$used" || ss -Hltn "sport = :$p" 2>/dev/null | grep -q .; do p=$((p+1)); done
+  echo "$p"
+}
+
+write_ssh_conf() {
+  local name=$1 port=$2
+  ensure_ssh_include
+  cat > "$SSHD_DIR/$(ct "$name").conf" <<EOF
+# managed by claude-box
+Host $(ct "$name")
+  HostName 127.0.0.1
+  Port $port
+  User dev
+  IdentityFile $KEY
+  IdentitiesOnly yes
+  StrictHostKeyChecking accept-new
+  UserKnownHostsFile $KNOWN
+  ServerAliveInterval 30
+EOF
+  chmod 600 "$SSHD_DIR/$(ct "$name").conf"
+}
+
+wait_ssh() {
+  local h=$1
+  for _ in $(seq 60); do
+    ssh -o BatchMode=yes -o ConnectTimeout=2 "$h" true 2>/dev/null && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# Find herdr even when PATH/HOME differ (sudo, newgrp, minimal shells). Override: CB_HERDR_BIN=/path/to/herdr
+REAL_USER=${SUDO_USER:-$(id -un)}
+REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+SCRIPT_OWNER_HOME=$(getent passwd "$(stat -c %U "$HERE")" | cut -d: -f6)
+find_bin() {
+  local b=$1 p
+  for p in "${CB_HERDR_BIN:-}" "$(command -v "$b" 2>/dev/null)" \
+           "$HOME/.local/bin/$b" "$REAL_HOME/.local/bin/$b" "$SCRIPT_OWNER_HOME/.local/bin/$b" \
+           "$HOME/bin/$b" "/usr/local/bin/$b" "/usr/bin/$b"; do
+    [ -n "$p" ] && [ -x "$p" ] && { echo "$p"; return 0; }
+  done
+  return 1
+}
+HERDR_BIN=$(find_bin herdr || true)
+
+cmd_herd() {
+  local name=$1 c; c=$(ct "$name")
+  if [ -z "$HERDR_BIN" ]; then
+    echo "claude-box: herdr not found. user=$(id -un) HOME=$HOME real_home=$REAL_HOME" >&2
+    echo "  PATH=$PATH" >&2
+    die "set CB_HERDR_BIN=/path/to/herdr (find it with: command -v herdr in your normal shell)"
+  fi
+  info "registering $c in herdr ($HERDR_BIN)"
+  "$HERDR_BIN" machine add "$c" --label "$c"
+  info "open it: herdr --remote $c   (or pick $c in the herdr sidebar)"
+}
+
+cmd_new() {
+  local name="" dir="" herd=0 image=$IMAGE pos=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --herd) herd=1 ;;
+      --from) shift; image=$(tpl_alias "${1:?--from needs a template name}") ;;
+      --from=*) image=$(tpl_alias "${1#--from=}") ;;
+      -*) die "unknown option $1" ;;
+      *) pos+=("$1") ;;
+    esac
+    shift
+  done
+  name=${pos[0]:-}; dir=${pos[1]:-}
+  [ -n "$name" ] && [ -n "$dir" ] || die "usage: new <name> <host-dir> [--from <template>] [--herd]"
+  valid_name "$name"; need_incus
+  exists "$name" && die "$(ct "$name") already exists"
+  incus image info "$image" >/dev/null 2>&1 || die "image '$image' missing (claude-box setup / claude-box templates)"
+  [ -f "$KEY.pub" ] || die "ssh key missing; run 'claude-box setup'"
+  mkdir -p "$dir"; dir=$(readlink -f "$dir")
+  case "$dir" in "$HOME"|"/"|"$HOME/.ssh"*) die "refusing to mount $dir";; esac
+
+  local c port; c=$(ct "$name"); port=$(next_port)
+  info "creating $c  (/workspace <- $dir, ssh 127.0.0.1:$port)"
+  incus init "$image" "$c" -p default -p "$PROFILE"
+  incus config set "$c" user.claude-box.sshport="$port" user.claude-box.workspace="$dir"
+  incus config device add "$c" work disk source="$dir" path=/workspace shift=true >/dev/null
+  incus config device add "$c" ssh proxy listen="tcp:127.0.0.1:$port" connect=tcp:127.0.0.1:22 >/dev/null
+  incus start "$c"
+
+  for _ in $(seq 60); do incus exec "$c" -- id dev >/dev/null 2>&1 && break; sleep 1; done
+  incus exec "$c" -- install -d -m 700 -o dev -g dev /home/dev/.ssh
+  incus file push "$KEY.pub" "$c/home/dev/.ssh/authorized_keys" --uid 1000 --gid 1000 --mode 0600
+  incus exec "$c" -- chown dev:dev /home/dev/.claude-config
+  # Unique identity per box (templates carry the source box's host keys / machine-id).
+  incus exec "$c" -- sh -c 'rm -f /etc/ssh/ssh_host_* && ssh-keygen -A >/dev/null && systemctl restart ssh
+    rm -f /etc/machine-id /var/lib/dbus/machine-id && systemd-machine-id-setup >/dev/null' || true
+
+  ssh-keygen -R "[127.0.0.1]:$port" -f "$KNOWN" >/dev/null 2>&1 || true
+  write_ssh_conf "$name" "$port"
+  if wait_ssh "$c"; then info "ssh ok: ssh $c"; else echo "warning: ssh to $c not answering yet" >&2; fi
+
+  [ $herd = 1 ] && cmd_herd "$name"
+  cat <<EOF
+
+Box $c ready.
+  claude-box claude $name          # Claude Code in /workspace (first time: log in)
+  claude-box claude $name --yolo   # --dangerously-skip-permissions
+  ssh $c                           # same route herdr uses
+  claude-box herd $name            # register in herdr
+  herdr --remote $c                # open herdr on the box
+EOF
+}
+
+tpl_alias() { case "$1" in "$IMAGE"|tpl-*) echo "$1";; *) echo "tpl-$1";; esac; }
+
+cmd_template() {  # template <box> [template-name]
+  local name=${1:-}; [ -n "$name" ] || die "usage: template <box> [template-name]"
+  need_incus; exists "$name" || die "no box $(ct "$name")"
+  local c alias snap; c=$(ct "$name"); alias=$(tpl_alias "${2:-$name}")
+  snap=tpl-$(date +%Y%m%d-%H%M%S)
+  info "snapshot $c/$snap -> image '$alias' (Claude login is on the shared volume, not in the image)"
+  incus exec "$c" -- sh -c 'apt-get clean; rm -rf /tmp/* /var/tmp/*' || true
+  incus snapshot create "$c" "$snap"
+  incus image delete "$alias" >/dev/null 2>&1 || true
+  incus publish "$c/$snap" --alias "$alias" description="claude-box template from $c ($snap)"
+  incus snapshot delete "$c" "$snap"
+  info "done. use: claude-box new <name> <dir> --from ${alias#tpl-}"
+}
+
+cmd_templates() {
+  need_incus
+  incus image list -f csv -c lsd 2>/dev/null | awk -F, -v base="$IMAGE" '$1==base || $1 ~ /^tpl-/ {printf "%-28s %-10s %s\n",$1,$2,$3}'
+}
+
+exec_dev() {  # exec_dev <name> <bash -lc script> [args...]
+  local name=$1; shift
+  need_incus; exists "$name" || die "no box $(ct "$name")"
+  local tflag=-T; [ -t 0 ] && [ -t 1 ] && tflag=-t
+  incus exec "$(ct "$name")" $tflag --user 1000 --group 1000 --cwd /workspace \
+    --env HOME=/home/dev --env USER=dev --env LOGNAME=dev --env TERM="${TERM:-xterm-256color}" \
+    -- bash -lc "$@"
+}
+
+cmd_claude() {
+  local name=${1:-}; [ -n "$name" ] || die "usage: claude <name> [--yolo] [args]"; shift
+  local args=()
+  for a in "$@"; do
+    if [ "$a" = --yolo ]; then args+=(--dangerously-skip-permissions); else args+=("$a"); fi
+  done
+  exec_dev "$name" 'exec claude "$@"' claude ${args[@]+"${args[@]}"}
+}
+
+cmd_rm() {
+  local name=${1:-}; [ -n "$name" ] || die "usage: rm <name> [-y]"
+  need_incus
+  local c port; c=$(ct "$name"); port=$(port_of "$name")
+  if [ "${2:-}" != -y ]; then
+    read -r -p "Delete $c? (/workspace host dir is kept) [y/N] " ans
+    [[ $ans == [yY]* ]] || exit 1
+  fi
+  if [ -n "$HERDR_BIN" ] && "$HERDR_BIN" machine list 2>/dev/null | grep -qw "$c"; then
+    "$HERDR_BIN" machine remove "$c" || true
+  fi
+  exists "$name" && incus delete -f "$c"
+  rm -f "$SSHD_DIR/$c.conf"
+  [ -n "$port" ] && ssh-keygen -R "[127.0.0.1]:$port" -f "$KNOWN" >/dev/null 2>&1 || true
+  info "removed $c"
+}
+
+cmd_ls() {
+  need_incus
+  printf '%-22s %-9s %-6s %s\n' NAME STATE SSH WORKSPACE
+  local c
+  for c in $(incus list -f csv -c n "^${PREFIX}"); do
+    [ "$c" = cb-base-build ] && continue
+    printf '%-22s %-9s %-6s %s\n' "$c" \
+      "$(incus list -f csv -c s "^$c\$")" \
+      "$(incus config get "$c" user.claude-box.sshport)" \
+      "$(incus config get "$c" user.claude-box.workspace)"
+  done
+}
+
+if [ "$(id -u)" = 0 ]; then
+  die "don't run as root/sudo: it would use root's ~/.ssh and herdr. Run it as your normal user."
+fi
+
+cmd=${1:-help}; shift || true
+case "$cmd" in
+  setup)        cmd_setup "$@" ;;
+  rebuild-base) need_incus; "$HERE/build-base.sh" ;;
+  new)          cmd_new "$@" ;;
+  claude)       cmd_claude "$@" ;;
+  shell)        [ -n "${1:-}" ] || die "usage: shell <name>"; exec_dev "$1" 'exec bash -l' ;;
+  ssh)          [ -n "${1:-}" ] || die "usage: ssh <name> [cmd]"; n=$1; shift; exec ssh "$(ct "$n")" "$@" ;;
+  herd)         [ -n "${1:-}" ] || die "usage: herd <name>"; cmd_herd "$1" ;;
+  snap)         [ -n "${1:-}" ] || die "usage: snap <name> [label]"; need_incus
+                incus snapshot create "$(ct "$1")" ${2:+"$2"}; incus snapshot list "$(ct "$1")" ;;
+  restore)      [ $# -eq 2 ] || die "usage: restore <name> <label>"; need_incus
+                incus snapshot restore "$(ct "$1")" "$2" ;;
+  start|stop)   [ -n "${1:-}" ] || die "usage: $cmd <name>"; need_incus; incus "$cmd" "$(ct "$1")" ;;
+  rm)           cmd_rm "$@" ;;
+  template)     cmd_template "$@" ;;
+  templates)    cmd_templates ;;
+  rm-template)  [ -n "${1:-}" ] || die "usage: rm-template <tpl>"; need_incus; incus image delete "$(tpl_alias "$1")" ;;
+  ls|list)      cmd_ls ;;
+  help|-h|--help) usage ;;
+  *)            usage; exit 1 ;;
+esac

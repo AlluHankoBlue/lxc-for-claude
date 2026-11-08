@@ -1,0 +1,17 @@
+description: Claude Code dev box (unprivileged, Docker-capable)
+config:
+  security.privileged: "false"
+  # Docker inside the box needs nesting + these syscall intercepts.
+  security.nesting: "true"
+  security.syscalls.intercept.mknod: "true"
+  security.syscalls.intercept.setxattr: "true"
+  linux.kernel_modules: overlay,br_netfilter,ip_tables,ip6_tables,nf_nat,xt_conntrack
+  limits.cpu: "4"
+  limits.memory: 6GiB
+devices:
+  # Shared Claude Code login/config for all boxes (an Incus volume, not host ~/.claude).
+  claude-auth:
+    type: disk
+    pool: default
+    source: claude-auth
+    path: /home/dev/.claude-config

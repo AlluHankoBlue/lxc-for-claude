@@ -1,0 +1,4 @@
+# local test artifacts
+selftest.log
+selftest-ws/
+testproj/
